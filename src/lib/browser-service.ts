@@ -1,4 +1,7 @@
 import { createHash } from "crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import type { AxiosResponse } from "axios";
 import {
   type Browser,
@@ -28,6 +31,7 @@ interface BrowserSession {
   context: BrowserContext;
   page: Page;
   lastUsed: number;
+  hasRetried?: boolean;
 }
 
 const SESSION_TTL_MS = 10 * 60 * 1000;
@@ -39,7 +43,37 @@ const SDK_SCRIPT_HOSTS = [
   "jianying.com",
   "capcutcdn-us.com",
   "capcutstatic.com",
+  // ByteDance 常见 CDN（风控/指纹 SDK 可能从这些域名加载脚本）
+  "bytedance.com",
+  "byteimg.com",
+  "ibytedtos.com",
+  "bytedtos.com",
+  "snssdk.com",
+  "pstatp.com",
+  "douyinstatic.com",
+  "toutiao.com",
+  "byted-cg.com",
+  "capcut.com",
+  "capcut.net",
+  "dreamina.com",
 ];
+
+// 注入 Cookie 时要跳过的字段（这些应由 SDK 实时生成，不应预注入旧值）
+const FINGERPRINT_COOKIE_NAMES = new Set([
+  "msToken",
+  "tt_chain_token",
+]);
+
+// 需要持久化到磁盘以保持设备指纹一致的 Cookie 名（跨浏览器重启复用）
+const FINGERPRINT_PERSIST_NAMES = ["_tea_web_id", "ttwid", "odin_tt", "dm_auid"];
+
+// 持久化指纹状态的有效期（30 天）
+const FINGERPRINT_STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface FingerprintState {
+  savedAt: number;
+  cookies: Record<string, string>;
+}
 const FORBIDDEN_FETCH_HEADERS = new Set([
   "accept-charset",
   "accept-encoding",
@@ -70,6 +104,38 @@ export default class BrowserService {
   private sessions = new Map<string, BrowserSession>();
   private cleanupTimer?: ReturnType<typeof setInterval>;
 
+  // ── 指纹持久化 ──────────────────────────────────────────────────────────────
+  private getFingerprintPath(sessionId: string): string {
+    const hash = createHash("md5").update(sessionId).digest("hex").slice(0, 16);
+    const dir = join(tmpdir(), "bs-fingerprints");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    return join(dir, `${hash}.json`);
+  }
+
+  private loadFingerprint(sessionId: string): FingerprintState | null {
+    try {
+      const file = this.getFingerprintPath(sessionId);
+      if (!existsSync(file)) return null;
+      const state: FingerprintState = JSON.parse(readFileSync(file, "utf-8"));
+      if (Date.now() - state.savedAt > FINGERPRINT_STATE_TTL_MS) {
+        logger.info("BrowserService 指纹状态已过期，将重新生成");
+        return null;
+      }
+      logger.info(`BrowserService 已加载持久化指纹: ${Object.keys(state.cookies).join(", ")}`);
+      return state;
+    } catch { return null; }
+  }
+
+  private saveFingerprint(sessionId: string, cookies: Record<string, string>): void {
+    try {
+      const state: FingerprintState = { savedAt: Date.now(), cookies };
+      writeFileSync(this.getFingerprintPath(sessionId), JSON.stringify(state), "utf-8");
+      logger.info(`BrowserService 指纹状态已持久化: ${Object.keys(cookies).join(", ")}`);
+    } catch (err: any) {
+      logger.warn(`BrowserService 保存指纹失败: ${err.message}`);
+    }
+  }
+
   static getInstance() {
     if (!BrowserService.instance) BrowserService.instance = new BrowserService();
     return BrowserService.instance;
@@ -77,6 +143,25 @@ export default class BrowserService {
 
   async request(options: BrowserRequestOptions): Promise<AxiosResponse> {
     const session = await this.getOrCreateSession(options);
+    let result = await this.sendXhr(session, options);
+
+    // 首次新会话请求时，服务端会通过 Set-Cookie 下发已激活的新 msToken；
+    // 原 msToken 是 SDK 本地生成的"未激活"值，服务端拒绝(4013)后自动重试一次。
+    if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013" && !session.hasRetried) {
+      session.hasRetried = true;
+      logger.info("BrowserService 风控拒绝(4013)，等待服务端 msToken 刷新后自动重试...");
+      await session.page.waitForTimeout(2000);
+      result = await this.sendXhr(session, options);
+    }
+
+    session.lastUsed = Date.now();
+    return { ...result, config: {}, request: null } as AxiosResponse;
+  }
+
+  private async sendXhr(
+    session: BrowserSession,
+    options: BrowserRequestOptions,
+  ): Promise<{ status: number; statusText: string; headers: Record<string, string>; data: any }> {
     const requestUrl = appendParams(options.url, options.params || {});
     const requestBody = stringifyBody(options.data);
     const headers = normalizeHeaders(options.headers || {});
@@ -85,7 +170,7 @@ export default class BrowserService {
 
     logger.info(`浏览器代理请求: ${options.method.toUpperCase()} ${requestUrl}`);
 
-    const result = (await session.page.evaluate(
+    return (await session.page.evaluate(
         async ({ method, url, headers, signInputHeaders, body, timeout }) => {
           const acrawler = (window as any).byted_acrawler;
           let signature: Record<string, string> = {};
@@ -119,9 +204,33 @@ export default class BrowserService {
             signedUrl.searchParams.set("X-Gnarly", signature["X-Gnarly"]);
             delete signature["X-Gnarly"];
           }
-          const mergedHeaders = { ...headers, ...signature };
+          // msToken 由 frontierSign 生成，必须放到 URL 参数（不能放 Header），服务端以此校验签名
+          if (signature["msToken"]) {
+            signedUrl.searchParams.set("msToken", signature["msToken"]);
+            delete signature["msToken"];
+          }
+          // 将浏览器真实的 _tea_web_id 作为 webId 写入 URL（国际站需要此参数）
+          if (!signedUrl.searchParams.has("webId")) {
+            const teaWebId = document.cookie
+              .split(";")
+              .map((p) => p.trim())
+              .find((p) => p.startsWith("_tea_web_id="))
+              ?.split("=")[1];
+            if (teaWebId) signedUrl.searchParams.set("webId", teaWebId);
+          }
+          // 尝试从 SDK 或 localStorage 获取设备 ID（did header）
+          const did = (() => {
+            try {
+              const ac = (window as any).byted_acrawler;
+              if (typeof ac?.getDeviceId === "function") return String(ac.getDeviceId());
+              if (typeof ac?.getAcDid === "function") return String(ac.getAcDid());
+              return localStorage.getItem("_d2id") || localStorage.getItem("byted_acrawler_device_id") || "";
+            } catch { return ""; }
+          })();
+          const mergedHeaders: Record<string, string> = { ...headers, ...signature };
+          if (did) mergedHeaders["did"] = did;
           console.info(
-            `[BrowserService] sign result X-Bogus=${signedUrl.searchParams.has("X-Bogus") ? "yes" : "no"}, X-Gnarly=${signedUrl.searchParams.has("X-Gnarly") ? "yes" : "no"}`
+            `[BrowserService] sign result X-Bogus=${signedUrl.searchParams.has("X-Bogus") ? "yes" : "no"}, X-Gnarly=${signedUrl.searchParams.has("X-Gnarly") ? "yes" : "no"}, msToken=${signedUrl.searchParams.has("msToken") ? "yes" : "no"}, webId=${signedUrl.searchParams.has("webId") ? "yes" : "no"}, did=${did ? "yes" : "no"}`
           );
 
           return await new Promise((resolve, reject) => {
@@ -180,19 +289,7 @@ export default class BrowserService {
           body: requestBody,
           timeout,
         }
-      )) as {
-        status: number;
-        statusText: string;
-        headers: Record<string, string>;
-        data: any;
-      };
-
-    session.lastUsed = Date.now();
-    return {
-      ...result,
-      config: {},
-      request: null,
-    } as AxiosResponse;
+      )) as { status: number; statusText: string; headers: Record<string, string>; data: any };
   }
 
   private async createSession(options: BrowserRequestOptions): Promise<BrowserSession> {
@@ -211,7 +308,20 @@ export default class BrowserService {
 
     const context = await browser.newContext(contextOptions);
     await context.route("**/*", (route) => this.routeRequest(route, baseUrl.hostname));
-    await addCookies(context, [baseUrl, new URL(referer)], String(headers.Cookie || headers.cookie || ""));
+
+    // 第一步：注入会话认证 Cookie（包含 generateCookie 生成的随机 _tea_web_id 作为基础值）
+    await addCookies(context, [baseUrl, new URL(referer)], String(headers.Cookie || headers.cookie || ""), FINGERPRINT_COOKIE_NAMES);
+
+    // 第二步：若磁盘有持久化的真实设备指纹，覆盖上面注入的随机 _tea_web_id
+    // 这样同一账号跨浏览器重启始终使用同一设备指纹，避免风控检测到设备切换
+    const savedFingerprint = this.loadFingerprint(options.sessionId);
+    if (savedFingerprint && savedFingerprint.cookies["_tea_web_id"]) {
+      const overrideCookieStr = Object.entries(savedFingerprint.cookies)
+        .map(([name, value]) => `${name}=${value}`)
+        .join("; ");
+      await addCookies(context, [baseUrl, new URL(referer)], overrideCookieStr);
+      logger.info(`BrowserService 已覆盖为持久化指纹: _tea_web_id=${savedFingerprint.cookies["_tea_web_id"].slice(0, 10)}...`);
+    }
 
     const page = await context.newPage();
     page.on("request", (request) => {
@@ -227,6 +337,22 @@ export default class BrowserService {
       if (text.startsWith("[BrowserService]")) logger.info(text);
     });
     await this.preparePage(page, referer, options.timeout);
+
+    // 页面初始化完成后，读取 SDK 生成/刷新的指纹 Cookie 并持久化
+    try {
+      const allCookies = await context.cookies();
+      const fingerprintCookies = Object.fromEntries(
+        allCookies
+          .filter((c) => FINGERPRINT_PERSIST_NAMES.includes(c.name) && c.value)
+          .map((c) => [c.name, c.value])
+      );
+      if (Object.keys(fingerprintCookies).length > 0) {
+        this.saveFingerprint(options.sessionId, fingerprintCookies);
+      }
+    } catch (err: any) {
+      logger.warn(`BrowserService 读取指纹 Cookie 失败: ${err.message}`);
+    }
+
     return { context, page, lastUsed: Date.now() };
   }
 
@@ -292,7 +418,9 @@ export default class BrowserService {
   private async launchBrowser(): Promise<Browser> {
     return launch({
       headless: false,
-      executablePath: "C:\\Users\\Administrator\\.cloakbrowser\\chromium-146.0.7680.177.4\\chrome.exe",
+      launchOptions:{
+        executablePath: "C:\\Users\\Administrator\\.cloakbrowser\\chromium-146.0.7680.177.4\\chrome.exe",
+      },
       args: [
         "--disable-background-networking",
         "--disable-background-timer-throttling",
@@ -311,10 +439,23 @@ export default class BrowserService {
         waitUntil: "domcontentloaded",
         timeout,
       });
-      await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
-      await page.waitForFunction(() => !!(window as any).byted_acrawler?.frontierSign, {
-        timeout: 15000,
-      }).catch(() => undefined);
+      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
+
+      // 等待 acrawler SDK 加载并初始化签名函数
+      const sdkReady = await page.waitForFunction(
+        () => !!(window as any).byted_acrawler?.frontierSign,
+        { timeout: 20000 }
+      ).then(() => true).catch(() => false);
+      logger.info(`BrowserService acrawler SDK ${sdkReady ? "已就绪" : "未就绪（无签名功能）"}`);
+
+      // 等待 SDK 生成 msToken（_tea_web_id 已在 createSession 预注入，无需等待）
+      const riskCookiesReady = await page.waitForFunction(
+        () => document.cookie.includes("msToken="),
+        { timeout: 15000 }
+      ).then(() => true).catch(() => false);
+      logger.info(`BrowserService 风控 Cookie ${riskCookiesReady ? "已就绪" : "未完全就绪，继续尝试"}`);
+
+      // 读取 SDK 生成的 _tea_web_id 并反馈给 acrawler，确保签名使用正确的 WebID
       await page.evaluate(() => {
         const acrawler = (window as any).byted_acrawler;
         if (!acrawler) return;
@@ -329,7 +470,23 @@ export default class BrowserService {
           acrawler.setTTWid?.(webId);
         }
       }).catch(() => undefined);
-      await page.waitForTimeout(800);
+
+      // 预热 frontierSign：SDK 首次调用时会异步向 ByteDance 注册设备指纹并验证 msToken
+      // 提前完成此流程，避免第一次实际请求因 SDK 尚未就绪而被风控拒绝
+      await page.evaluate(async () => {
+        const ac = (window as any).byted_acrawler;
+        if (ac?.frontierSign) {
+          try {
+            await Promise.race([
+              ac.frontierSign(window.location.href),
+              new Promise((resolve) => setTimeout(resolve, 5000)),
+            ]);
+          } catch (_) {}
+        }
+      }).catch(() => undefined);
+
+      // 等待 SDK 内部异步任务（设备注册、msToken 刷新等）在后台彻底完成
+      await page.waitForTimeout(2000);
       logger.info(`BrowserService 会话初始化完成: ${referer}`);
     } catch (error: any) {
       logger.warn(`BrowserService 会话初始化未完全完成，将继续尝试提交: ${error.message}`);
@@ -447,7 +604,12 @@ function normalizeContextHeaders(headers: Record<string, HeaderValue>): Record<s
   return result;
 }
 
-async function addCookies(context: BrowserContext, urls: URL[], cookieHeader: string): Promise<void> {
+async function addCookies(
+  context: BrowserContext,
+  urls: URL[],
+  cookieHeader: string,
+  skipNames?: Set<string>
+): Promise<void> {
   const hosts = [...new Map(urls.map((url) => [url.hostname, url])).values()];
   const cookies = hosts.flatMap((url) =>
     cookieHeader
@@ -457,8 +619,10 @@ async function addCookies(context: BrowserContext, urls: URL[], cookieHeader: st
       .map((part) => {
         const separator = part.indexOf("=");
         if (separator <= 0) return null;
+        const name = part.slice(0, separator);
+        if (skipNames?.has(name)) return null;
         return {
-          name: part.slice(0, separator),
+          name,
           value: part.slice(separator + 1),
           domain: url.hostname,
           path: "/",
