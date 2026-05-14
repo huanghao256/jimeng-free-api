@@ -29,12 +29,12 @@ export interface BrowserRequestOptions {
 
 interface BrowserSession {
   context: BrowserContext;
-  page: Page;
+  page: Page | null;
   lastUsed: number;
   hasRetried?: boolean;
 }
 
-const SESSION_TTL_MS = 10 * 60 * 1000;
+const SESSION_TTL_MS = 3 * 60 * 1000;
 
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const SDK_SCRIPT_HOSTS = [
@@ -143,23 +143,31 @@ export default class BrowserService {
 
   async request(options: BrowserRequestOptions): Promise<AxiosResponse> {
     const session = await this.getOrCreateSession(options);
-    let result = await this.sendXhr(session, options);
+    const page = session.page!;
+    try {
+      let result = await this.sendXhr(page, options);
 
-    // 首次新会话请求时，服务端会通过 Set-Cookie 下发已激活的新 msToken；
-    // 原 msToken 是 SDK 本地生成的"未激活"值，服务端拒绝(4013)后自动重试一次。
-    if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013" && !session.hasRetried) {
-      session.hasRetried = true;
-      logger.info("BrowserService 风控拒绝(4013)，等待服务端 msToken 刷新后自动重试...");
-      await session.page.waitForTimeout(2000);
-      result = await this.sendXhr(session, options);
+      // 首次新会话请求时，服务端会通过 Set-Cookie 下发已激活的新 msToken；
+      // 原 msToken 是 SDK 本地生成的"未激活"值，服务端拒绝(4013)后自动重试一次。
+      if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013" && !session.hasRetried) {
+        session.hasRetried = true;
+        logger.info("BrowserService 风控拒绝(4013)，等待服务端 msToken 刷新后自动重试...");
+        await page.waitForTimeout(2000);
+        result = await this.sendXhr(page, options);
+      }
+
+      session.lastUsed = Date.now();
+      return { ...result, config: {}, request: null } as AxiosResponse;
+    } finally {
+      // 请求结束后关闭 Page 释放渲染内存；Context 保持存活，Cookie 不丢失
+      page.close().catch(() => undefined);
+      session.page = null;
+      session.hasRetried = false;
     }
-
-    session.lastUsed = Date.now();
-    return { ...result, config: {}, request: null } as AxiosResponse;
   }
 
   private async sendXhr(
-    session: BrowserSession,
+    page: Page,
     options: BrowserRequestOptions,
   ): Promise<{ status: number; statusText: string; headers: Record<string, string>; data: any }> {
     const requestUrl = appendParams(options.url, options.params || {});
@@ -170,7 +178,7 @@ export default class BrowserService {
 
     logger.info(`浏览器代理请求: ${options.method.toUpperCase()} ${requestUrl}`);
 
-    return (await session.page.evaluate(
+    return (await page.evaluate(
         async ({ method, url, headers, signInputHeaders, body, timeout }) => {
           const acrawler = (window as any).byted_acrawler;
           let signature: Record<string, string> = {};
@@ -323,6 +331,16 @@ export default class BrowserService {
       logger.info(`BrowserService 已覆盖为持久化指纹: _tea_web_id=${savedFingerprint.cookies["_tea_web_id"].slice(0, 10)}...`);
     }
 
+    const page = await this.createPageInContext(context, options);
+    return { context, page, lastUsed: Date.now() };
+  }
+
+  // 在已有 Context 中新建 Page 并完成 SDK 初始化（Cookie 由 Context 自动继承）
+  private async createPageInContext(
+    context: BrowserContext,
+    options: BrowserRequestOptions,
+  ): Promise<Page> {
+    const referer = options.referer || new URL(options.url).origin;
     const page = await context.newPage();
     page.on("request", (request) => {
       if (!request.url().includes("/mweb/v1/aigc_draft/generate")) return;
@@ -338,7 +356,7 @@ export default class BrowserService {
     });
     await this.preparePage(page, referer, options.timeout);
 
-    // 页面初始化完成后，读取 SDK 生成/刷新的指纹 Cookie 并持久化
+    // 读取 SDK 初始化后的指纹 Cookie 并持久化（每次建 Page 后刷新一次）
     try {
       const allCookies = await context.cookies();
       const fingerprintCookies = Object.fromEntries(
@@ -353,21 +371,24 @@ export default class BrowserService {
       logger.warn(`BrowserService 读取指纹 Cookie 失败: ${err.message}`);
     }
 
-    return { context, page, lastUsed: Date.now() };
+    return page;
   }
 
   private async getOrCreateSession(options: BrowserRequestOptions): Promise<BrowserSession> {
     const cached = this.sessions.get(options.sessionId);
     if (cached) {
-      try {
-        await cached.page.evaluate(() => true);
+      // Page 在上次请求结束时已关闭；检查 Context 是否仍存活
+      const contextAlive = await cached.context.cookies().then(() => true).catch(() => false);
+      if (contextAlive) {
+        // Context 存活（Cookie 完整）：只需重建 Page，无需重建 Context
+        logger.info(`BrowserService 重建 Page（复用 Context）: ${options.sessionId}`);
+        cached.page = await this.createPageInContext(cached.context, options);
         cached.lastUsed = Date.now();
-        logger.info(`BrowserService 复用会话: ${options.sessionId}`);
         return cached;
-      } catch {
-        this.sessions.delete(options.sessionId);
-        await this.closeContext(cached.context);
       }
+      // Context 已失效，完整重建
+      this.sessions.delete(options.sessionId);
+      await this.closeContext(cached.context);
     }
 
     const session = await this.createSession(options);
@@ -471,22 +492,6 @@ export default class BrowserService {
         }
       }).catch(() => undefined);
 
-      // 预热 frontierSign：SDK 首次调用时会异步向 ByteDance 注册设备指纹并验证 msToken
-      // 提前完成此流程，避免第一次实际请求因 SDK 尚未就绪而被风控拒绝
-      await page.evaluate(async () => {
-        const ac = (window as any).byted_acrawler;
-        if (ac?.frontierSign) {
-          try {
-            await Promise.race([
-              ac.frontierSign(window.location.href),
-              new Promise((resolve) => setTimeout(resolve, 5000)),
-            ]);
-          } catch (_) {}
-        }
-      }).catch(() => undefined);
-
-      // 等待 SDK 内部异步任务（设备注册、msToken 刷新等）在后台彻底完成
-      await page.waitForTimeout(2000);
       logger.info(`BrowserService 会话初始化完成: ${referer}`);
     } catch (error: any) {
       logger.warn(`BrowserService 会话初始化未完全完成，将继续尝试提交: ${error.message}`);
