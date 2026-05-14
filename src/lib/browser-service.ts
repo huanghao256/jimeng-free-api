@@ -1,8 +1,6 @@
-import fs from "fs";
 import { createHash } from "crypto";
 import type { AxiosResponse } from "axios";
 import {
-  chromium,
   type Browser,
   type BrowserContext,
   type BrowserContextOptions,
@@ -11,7 +9,7 @@ import {
 } from "playwright-core";
 
 import logger from "@/lib/logger.ts";
-
+import { launch } from "cloakbrowser";
 type HeaderValue = any;
 
 export interface BrowserRequestOptions {
@@ -29,7 +27,10 @@ export interface BrowserRequestOptions {
 interface BrowserSession {
   context: BrowserContext;
   page: Page;
+  lastUsed: number;
 }
+
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const SDK_SCRIPT_HOSTS = [
@@ -66,6 +67,8 @@ export default class BrowserService {
   private static instance?: BrowserService;
   private browser?: Browser;
   private launching?: Promise<Browser>;
+  private sessions = new Map<string, BrowserSession>();
+  private cleanupTimer?: ReturnType<typeof setInterval>;
 
   static getInstance() {
     if (!BrowserService.instance) BrowserService.instance = new BrowserService();
@@ -73,17 +76,16 @@ export default class BrowserService {
   }
 
   async request(options: BrowserRequestOptions): Promise<AxiosResponse> {
-    const session = await this.createSession(options);
-    try {
-      const requestUrl = appendParams(options.url, options.params || {});
-      const requestBody = stringifyBody(options.data);
-      const headers = normalizeHeaders(options.headers || {});
-      const signHeaders = getSignHeaders(requestBody);
-      const timeout = options.timeout || 45000;
+    const session = await this.getOrCreateSession(options);
+    const requestUrl = appendParams(options.url, options.params || {});
+    const requestBody = stringifyBody(options.data);
+    const headers = normalizeHeaders(options.headers || {});
+    const signHeaders = getSignHeaders(requestBody);
+    const timeout = options.timeout || 45000;
 
-      logger.info(`浏览器代理请求: ${options.method.toUpperCase()} ${requestUrl}`);
+    logger.info(`浏览器代理请求: ${options.method.toUpperCase()} ${requestUrl}`);
 
-      const result = (await session.page.evaluate(
+    const result = (await session.page.evaluate(
         async ({ method, url, headers, signInputHeaders, body, timeout }) => {
           const acrawler = (window as any).byted_acrawler;
           let signature: Record<string, string> = {};
@@ -185,14 +187,12 @@ export default class BrowserService {
         data: any;
       };
 
-      return {
-        ...result,
-        config: {},
-        request: null,
-      } as AxiosResponse;
-    } finally {
-      await this.closeContext(session.context);
-    }
+    session.lastUsed = Date.now();
+    return {
+      ...result,
+      config: {},
+      request: null,
+    } as AxiosResponse;
   }
 
   private async createSession(options: BrowserRequestOptions): Promise<BrowserSession> {
@@ -227,7 +227,47 @@ export default class BrowserService {
       if (text.startsWith("[BrowserService]")) logger.info(text);
     });
     await this.preparePage(page, referer, options.timeout);
-    return { context, page };
+    return { context, page, lastUsed: Date.now() };
+  }
+
+  private async getOrCreateSession(options: BrowserRequestOptions): Promise<BrowserSession> {
+    const cached = this.sessions.get(options.sessionId);
+    if (cached) {
+      try {
+        await cached.page.evaluate(() => true);
+        cached.lastUsed = Date.now();
+        logger.info(`BrowserService 复用会话: ${options.sessionId}`);
+        return cached;
+      } catch {
+        this.sessions.delete(options.sessionId);
+        await this.closeContext(cached.context);
+      }
+    }
+
+    const session = await this.createSession(options);
+    this.sessions.set(options.sessionId, session);
+    this.ensureCleanupScheduled();
+    return session;
+  }
+
+  private ensureCleanupScheduled(): void {
+    if (this.cleanupTimer) return;
+    this.cleanupTimer = setInterval(() => { this.cleanupStaleSessions(); }, 60_000);
+  }
+
+  private async cleanupStaleSessions(): Promise<void> {
+    const now = Date.now();
+    for (const [id, session] of this.sessions) {
+      if (now - session.lastUsed > SESSION_TTL_MS) {
+        logger.info(`BrowserService 清理过期会话: ${id}`);
+        this.sessions.delete(id);
+        await this.closeContext(session.context);
+      }
+    }
+    if (this.sessions.size === 0 && this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+    }
   }
 
   private async ensureBrowser(): Promise<Browser> {
@@ -238,7 +278,7 @@ export default class BrowserService {
       .then((browser) => {
         this.browser = browser;
         this.launching = undefined;
-        logger.info("BrowserService headless Chromium 已启动");
+        logger.info("BrowserService CloakBrowser Chromium 已启动");
         return browser;
       })
       .catch((error) => {
@@ -250,8 +290,9 @@ export default class BrowserService {
   }
 
   private async launchBrowser(): Promise<Browser> {
-    const baseOptions = {
-      headless: true,
+    return launch({
+      headless: false,
+      executablePath: "C:\\Users\\Administrator\\.cloakbrowser\\chromium-146.0.7680.177.4\\chrome.exe",
       args: [
         "--disable-background-networking",
         "--disable-background-timer-throttling",
@@ -261,25 +302,7 @@ export default class BrowserService {
         "--no-first-run",
         "--no-sandbox",
       ],
-    };
-
-    const executablePath = findChromiumExecutable();
-    if (executablePath) {
-      return chromium.launch({ ...baseOptions, executablePath });
-    }
-
-    const channel = process.env.PLAYWRIGHT_CHROMIUM_CHANNEL || "chrome";
-    try {
-      return await chromium.launch({ ...baseOptions, channel });
-    } catch (error: any) {
-      try {
-        return await chromium.launch({ ...baseOptions, channel: "msedge" });
-      } catch {
-        throw new Error(
-          `无法启动 Chromium，请安装 Chrome/Edge 或设置 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH。原始错误: ${error.message}`
-        );
-      }
-    }
+    }) as unknown as Browser;
   }
 
   private async preparePage(page: Page, referer: string, timeout = 45000): Promise<void> {
@@ -453,29 +476,6 @@ function isAllowedSdkHost(hostname: string): boolean {
   return SDK_SCRIPT_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
 }
 
-function findChromiumExecutable(): string | undefined {
-  const envPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || process.env.CHROME_PATH;
-  if (envPath && fs.existsSync(envPath)) return envPath;
-
-  const candidates =
-    process.platform === "win32"
-      ? [
-          "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-          "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-          "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-          "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-        ]
-      : [
-          "/usr/bin/google-chrome",
-          "/usr/bin/google-chrome-stable",
-          "/usr/bin/chromium",
-          "/usr/bin/chromium-browser",
-          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-          "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        ];
-
-  return candidates.find((candidate) => fs.existsSync(candidate));
-}
 
 function parsePlaywrightProxy(proxyUrl: string): BrowserContextOptions["proxy"] {
   try {
