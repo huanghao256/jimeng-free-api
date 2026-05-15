@@ -25,18 +25,6 @@ function materialsFromLocalPaths(filePaths: string[]) {
   }));
 }
 
-function pickMember(region: string, accountType: number) {
-  const members = adminDb.listMemberAccounts();
-  return members.find((member: any) =>
-    Number(member.status) === 1 &&
-    member.region === region &&
-    Number(member.accountType) === Number(accountType)
-  ) || members.find((member: any) =>
-    Number(member.status) === 1 &&
-    member.region === region
-  ) || members.find((member: any) => Number(member.status) === 1) || null;
-}
-
 export default {
   prefix: "/v1/tasks",
 
@@ -59,20 +47,15 @@ export default {
         resolution = "720p",
         duration = null,
         filePaths = [],
-        memberId,
-        accountName,
         region = config.region,
         notify = null,
         taskId = `api_task_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
       } = request.body;
-      const selectedMember = memberId
-        ? adminDb.listMemberAccounts().find((member: any) => Number(member.id) === Number(memberId))
-        : pickMember(region, config.accountType);
 
       const id = adminDb.createTask({
         taskId,
-        memberId: selectedMember?.id || null,
-        accountName: accountName || selectedMember?.accountName || "API创建任务",
+        memberId: null,
+        accountName: "待分配账号",
         model,
         region,
         ratio,

@@ -10,6 +10,7 @@ import logger from "@/lib/logger.ts";
 
 const activeSubmitTaskIds = new Set<number>();
 const activeCallbackTaskIds = new Set<number>();
+const activeSubmitMemberIds = new Set<number>();
 
 let submitTimer: NodeJS.Timeout | null = null;
 let callbackTimer: NodeJS.Timeout | null = null;
@@ -70,10 +71,33 @@ function selectMember(config: any, excludedMemberIds = new Set<number>()) {
   return member;
 }
 
+function mergeMemberExclusions(...sets: Set<number>[]) {
+  const merged = new Set<number>();
+  sets.forEach((set) => set.forEach((id) => merged.add(Number(id))));
+  return merged;
+}
+
+function hasSelectableMemberForTask(task: any, config: any, excludedMemberIds = new Set<number>()) {
+  if (task.memberId) {
+    const member = adminDb.findMemberById(Number(task.memberId));
+    if (member?.sessionId && Number(member.status) === 1) return !excludedMemberIds.has(Number(member.id));
+  }
+  return adminDb
+    .listRunnableMemberAccounts(config.region, config.accountType)
+    .some((member: any) => !excludedMemberIds.has(Number(member.id)));
+}
+
+function busyMemberIds() {
+  return mergeMemberExclusions(activeSubmitMemberIds);
+}
+
 function selectMemberForTask(task: any, config: any, excludedMemberIds = new Set<number>()) {
   if (task.memberId) {
     const member = adminDb.findMemberById(Number(task.memberId));
-    if (member?.sessionId && Number(member.status) === 1 && !excludedMemberIds.has(Number(member.id))) return member;
+    if (member?.sessionId && Number(member.status) === 1) {
+      if (excludedMemberIds.has(Number(member.id))) return null;
+      return member;
+    }
     logger.warn(`[TaskRunner] bound member is unavailable: task=${task.id}, memberId=${task.memberId}`);
   }
   return selectMember(config, excludedMemberIds);
@@ -207,13 +231,19 @@ function submitFailureReason(error: any) {
   return `${apiRet}${apiMessage}`.slice(0, 500);
 }
 
-async function submitTaskWithMemberRotation(task: any, config: any) {
+async function submitTaskWithMemberRotation(task: any, config: any, initialMember: any = null) {
   const attemptedMemberIds = new Set<number>();
   let lastReason = "";
+  let nextMember = initialMember;
 
   while (true) {
-    const member = selectMemberForTask(task, config, attemptedMemberIds);
+    const member = nextMember || selectMemberForTask(task, config, mergeMemberExclusions(attemptedMemberIds, busyMemberIds()));
+    nextMember = null;
     if (!member) {
+      if (hasSelectableMemberForTask(task, config, attemptedMemberIds)) {
+        logger.info(`[TaskRunner] task waiting for available member: ${taskLogLabel(task)}`);
+        return;
+      }
       const reason = lastReason
         ? `All runnable member accounts failed. Last error: ${lastReason}`
         : "No enabled member account matched current config";
@@ -228,7 +258,9 @@ async function submitTaskWithMemberRotation(task: any, config: any) {
       return;
     }
 
-    attemptedMemberIds.add(Number(member.id));
+    const memberId = Number(member.id);
+    attemptedMemberIds.add(memberId);
+    activeSubmitMemberIds.add(memberId);
 
     try {
       await submitTask(task, member);
@@ -237,6 +269,8 @@ async function submitTaskWithMemberRotation(task: any, config: any) {
       lastReason = submitFailureReason(error);
       logger.error(`[TaskRunner] submit failed, disabling member and retrying: task=${task.id}, member=${member.id}, ${lastReason}`);
       adminDb.closeMemberAccount(Number(member.id), lastReason);
+    } finally {
+      activeSubmitMemberIds.delete(memberId);
     }
   }
 }
@@ -259,13 +293,29 @@ async function runSubmitBatch() {
     return;
   }
 
-  const tasks = adminDb.listPendingTasks(slots).filter((task: any) => !activeSubmitTaskIds.has(Number(task.id)));
+  const scanLimit = Math.max(slots, maxParallel * 4);
+  const tasks = adminDb.listPendingTasks(scanLimit).filter((task: any) => !activeSubmitTaskIds.has(Number(task.id)));
   logger.info(`[TaskRunner] submit batch scan: pending=${tasks.length}, slots=${slots}, processing=${processingCount}, active=${activeSubmitTaskIds.size}, region=${config.region}, accountType=${config.accountType}`);
   if (!tasks.length) return;
 
+  let started = 0;
+  const reservedMemberIds = busyMemberIds();
   for (const task of tasks) {
+    if (started >= slots) break;
+    const member = selectMemberForTask(task, config, reservedMemberIds);
+    if (!member) {
+      if (hasSelectableMemberForTask(task, config)) {
+        logger.info(`[TaskRunner] submit task skipped: all matching members are busy, ${taskLogLabel(task)}`);
+        continue;
+      }
+    } else {
+      reservedMemberIds.add(Number(member.id));
+      activeSubmitMemberIds.add(Number(member.id));
+    }
+
     activeSubmitTaskIds.add(task.id);
-    void submitTaskWithMemberRotation(task, config)
+    started += 1;
+    void submitTaskWithMemberRotation(task, config, member)
       .catch((error: any) => {
         logger.error(`Submit task failed: id=${task.id}, ${error.message}`);
         adminDb.markTaskSubmitFailed(task.id, error?.message || String(error));
@@ -386,6 +436,7 @@ export function getTaskRunnerStatus() {
     callbackRunning,
     activeSubmitCount: activeSubmitTaskIds.size,
     activeCallbackCount: activeCallbackTaskIds.size,
+    activeSubmitMemberCount: activeSubmitMemberIds.size,
     lastCallbackAt,
   };
 }
