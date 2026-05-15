@@ -1,4 +1,4 @@
-import { spawnSync } from "child_process";
+import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs-extra";
 
@@ -22,6 +22,16 @@ const dbDir = path.join(path.resolve(), "data");
 const dbPath = path.join(dbDir, "admin.sqlite");
 
 type SqlValue = string | number | boolean | null | undefined;
+
+let db: Database.Database | null = null;
+
+function getDb() {
+  if (!db) {
+    fs.ensureDirSync(dbDir);
+    db = new Database(dbPath);
+  }
+  return db;
+}
 
 function now() {
   return new Date().toISOString();
@@ -72,25 +82,12 @@ function parseMaterials(value: any) {
   }
 }
 
-function execSql(sql: string, json = false) {
-  fs.ensureDirSync(dbDir);
-  const result = spawnSync("sqlite3", [json ? "-json" : "-batch", dbPath], {
-    input: Buffer.from(sql, "utf8"),
-    windowsHide: true,
-  });
-
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(result.stderr.toString("utf8") || `sqlite3 exited with status ${result.status}`);
-  }
-
-  return result.stdout.toString("utf8").trim();
+function execSql(sql: string) {
+  getDb().exec(sql);
 }
 
 function query(sql: string) {
-  const output = execSql(sql, true);
-  if (!output) return [];
-  return JSON.parse(output);
+  return getDb().prepare(sql).all();
 }
 
 function queryOne(sql: string) {

@@ -1,0 +1,6 @@
+# Service name
+name: jimeng-api
+# Bind address
+host: '0.0.0.0'
+# Bind port
+port: 5100

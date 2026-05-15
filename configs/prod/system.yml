@@ -1,0 +1,15 @@
+# Request logging
+requestLog: true
+# Temporary file directory
+tmpDir: ./tmp
+# Application log directory
+logDir: ./logs
+# Log flush interval in milliseconds
+logWriteInterval: 200
+# Log file retention in milliseconds
+logFileExpires: 2626560000
+# Temporary file retention in milliseconds
+tmpFileExpires: 86400000
+# Log level: error, warning, info, debug
+log_level: info
+debug: false

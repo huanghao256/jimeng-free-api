@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { AxiosResponse } from "axios";
@@ -31,10 +31,14 @@ interface BrowserSession {
   context: BrowserContext;
   page: Page | null;
   lastUsed: number;
+  pageLastUsed: number;
   hasRetried?: boolean;
 }
 
-const SESSION_TTL_MS = 3 * 60 * 1000;
+// Context 存活时长（保留设备指纹 Cookie）
+const SESSION_TTL_MS = 10 * 60 * 1000;
+// Page 空闲关闭时长（释放内存；重建 Page 时设备已注册，10s 等待即可通过 shark）
+const PAGE_IDLE_TTL_MS = 3 * 60 * 1000;
 
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const SDK_SCRIPT_HOSTS = [
@@ -115,7 +119,11 @@ export default class BrowserService {
   private loadFingerprint(sessionId: string): FingerprintState | null {
     try {
       const file = this.getFingerprintPath(sessionId);
-      if (!existsSync(file)) return null;
+      logger.info(`BrowserService 查找指纹文件: ${file}`);
+      if (!existsSync(file)) {
+        logger.info("BrowserService 指纹文件不存在，将重新生成");
+        return null;
+      }
       const state: FingerprintState = JSON.parse(readFileSync(file, "utf-8"));
       if (Date.now() - state.savedAt > FINGERPRINT_STATE_TTL_MS) {
         logger.info("BrowserService 指纹状态已过期，将重新生成");
@@ -128,11 +136,30 @@ export default class BrowserService {
 
   private saveFingerprint(sessionId: string, cookies: Record<string, string>): void {
     try {
-      const state: FingerprintState = { savedAt: Date.now(), cookies };
+      // _tea_web_id 一旦注册到服务端就不能变（多设备 ID 会触发 shark 账号异常）
+      // 若磁盘已有注册过的值，强制保留原值，防止 SDK 重新生成后覆盖导致设备 ID 漂移
+      const existing = this.loadFingerprint(sessionId);
+      const lockedWebId = existing?.cookies["_tea_web_id"];
+      const finalCookies = lockedWebId
+        ? { ...cookies, _tea_web_id: lockedWebId }
+        : cookies;
+      const state: FingerprintState = { savedAt: Date.now(), cookies: finalCookies };
       writeFileSync(this.getFingerprintPath(sessionId), JSON.stringify(state), "utf-8");
-      logger.info(`BrowserService 指纹状态已持久化: ${Object.keys(cookies).join(", ")}`);
+      logger.info(`BrowserService 指纹状态已持久化: ${Object.keys(finalCookies).join(", ")}`);
     } catch (err: any) {
       logger.warn(`BrowserService 保存指纹失败: ${err.message}`);
+    }
+  }
+
+  private deleteFingerprint(sessionId: string): void {
+    try {
+      const file = this.getFingerprintPath(sessionId);
+      if (existsSync(file)) {
+        unlinkSync(file);
+        logger.info(`BrowserService 指纹文件已删除（设备被 shark 标记，下次重新注册）: ${sessionId}`);
+      }
+    } catch (err: any) {
+      logger.warn(`BrowserService 删除指纹失败: ${err.message}`);
     }
   }
 
@@ -142,27 +169,52 @@ export default class BrowserService {
   }
 
   async request(options: BrowserRequestOptions): Promise<AxiosResponse> {
-    const session = await this.getOrCreateSession(options);
-    const page = session.page!;
-    try {
-      let result = await this.sendXhr(page, options);
+    // 允许在当前请求内自动重置设备一次：
+    // 若旧设备三次均 4013，立即删指纹、换新设备重试，避免误判为失败返回给调用方
+    let allowDeviceReset = true;
 
-      // 首次新会话请求时，服务端会通过 Set-Cookie 下发已激活的新 msToken；
-      // 原 msToken 是 SDK 本地生成的"未激活"值，服务端拒绝(4013)后自动重试一次。
-      if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013" && !session.hasRetried) {
-        session.hasRetried = true;
-        logger.info("BrowserService 风控拒绝(4013)，等待服务端 msToken 刷新后自动重试...");
-        await page.waitForTimeout(2000);
-        result = await this.sendXhr(page, options);
+    while (true) {
+      const session = await this.getOrCreateSession(options);
+      const page = session.page!;
+      try {
+        let result = await this.sendXhr(page, options);
+
+        // 首次 4013：等待服务端完成设备注册后重试
+        if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013" && !session.hasRetried) {
+          session.hasRetried = true;
+          logger.info("BrowserService 风控拒绝(4013)，等待设备注册后重试 #1（5s）...");
+          await page.waitForTimeout(5000);
+          result = await this.sendXhr(page, options);
+        }
+
+        // 第二次 4013：再等更长时间让注册流程完成
+        if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013") {
+          logger.warn("BrowserService 重试#1仍4013，等待设备注册后重试 #2（12s）...");
+          await page.waitForTimeout(12000);
+          result = await this.sendXhr(page, options);
+        }
+
+        // 三次全失败：设备 ID 被 shark 标记，删除指纹并销毁 Session
+        if (result.data?.ret === "-6" && result.data?.data?.fail_code === "4013") {
+          logger.warn("BrowserService 三次均4013，删除污染指纹并销毁会话");
+          this.deleteFingerprint(options.sessionId);
+          this.sessions.delete(options.sessionId);
+          this.closeContext(session.context).catch(() => undefined);
+
+          if (allowDeviceReset) {
+            allowDeviceReset = false;
+            logger.info("BrowserService 自动切换新设备重试（新设备注册约需 30s）...");
+            continue; // 回到 while 顶部，用新设备重走完整流程
+          }
+          logger.warn("BrowserService 新设备仍 4013，放弃重试");
+        }
+
+        session.lastUsed = Date.now();
+        session.pageLastUsed = Date.now();
+        return { ...result, config: {}, request: null } as AxiosResponse;
+      } finally {
+        session.hasRetried = false;
       }
-
-      session.lastUsed = Date.now();
-      return { ...result, config: {}, request: null } as AxiosResponse;
-    } finally {
-      // 请求结束后关闭 Page 释放渲染内存；Context 保持存活，Cookie 不丢失
-      page.close().catch(() => undefined);
-      session.page = null;
-      session.hasRetried = false;
     }
   }
 
@@ -320,19 +372,39 @@ export default class BrowserService {
     // 第一步：注入会话认证 Cookie（包含 generateCookie 生成的随机 _tea_web_id 作为基础值）
     await addCookies(context, [baseUrl, new URL(referer)], String(headers.Cookie || headers.cookie || ""), FINGERPRINT_COOKIE_NAMES);
 
-    // 第二步：若磁盘有持久化的真实设备指纹，覆盖上面注入的随机 _tea_web_id
-    // 这样同一账号跨浏览器重启始终使用同一设备指纹，避免风控检测到设备切换
+    // 第二步：若磁盘有持久化设备 ID，只覆盖 _tea_web_id，其余 Cookie 由用户 Cookie header 提供
+    // 不注入磁盘上的 ttwid 等——SDK 每次运行会刷新它们，用旧值会覆盖用户传入的最新值导致 shark 失败
     const savedFingerprint = this.loadFingerprint(options.sessionId);
     if (savedFingerprint && savedFingerprint.cookies["_tea_web_id"]) {
-      const overrideCookieStr = Object.entries(savedFingerprint.cookies)
-        .map(([name, value]) => `${name}=${value}`)
-        .join("; ");
-      await addCookies(context, [baseUrl, new URL(referer)], overrideCookieStr);
-      logger.info(`BrowserService 已覆盖为持久化指纹: _tea_web_id=${savedFingerprint.cookies["_tea_web_id"].slice(0, 10)}...`);
+      const webId = savedFingerprint.cookies["_tea_web_id"];
+      await addCookies(context, [baseUrl, new URL(referer)], `_tea_web_id=${webId}`);
+      logger.info(`BrowserService 已覆盖为持久化指纹: _tea_web_id=${webId.slice(0, 10)}...`);
     }
 
+    // 记录注入后的 _tea_web_id（页面加载前）
+    const cookiesBefore = await context.cookies();
+    const webIdBefore = cookiesBefore.find((c) => c.name === "_tea_web_id")?.value ?? "";
+    logger.info(`BrowserService 页面加载前 _tea_web_id: ${webIdBefore.slice(0, 15) || "（未注入）"}`);
+
     const page = await this.createPageInContext(context, options);
-    return { context, page, lastUsed: Date.now() };
+
+    // 首次运行（无持久化指纹）：设备 ID 全新，shark 系统需要时间在服务端完成设备注册。
+    // 实测本地已注册设备 ~21s 后能通过；全新设备需更长时间，额外等待 30s 以确保注册完成。
+    if (!savedFingerprint) {
+      logger.info("BrowserService 新设备首次运行，等待 30s 让 shark 完成服务端设备注册...");
+      await page.waitForTimeout(30000);
+      logger.info("BrowserService 新设备等待完成，开始 API 请求");
+    }
+
+    // 记录 SDK 运行后的 _tea_web_id，判断是否被重新生成
+    const cookiesAfter = await context.cookies();
+    const webIdAfter = cookiesAfter.find((c) => c.name === "_tea_web_id")?.value ?? "";
+    logger.info(
+      `BrowserService 页面加载后 _tea_web_id: ${webIdAfter.slice(0, 15) || "（未生成）"}` +
+      (webIdBefore && webIdAfter && webIdBefore !== webIdAfter ? " ⚠ SDK已重新生成，原值失效" : " ✓ 与注入值一致")
+    );
+
+    return { context, page, lastUsed: Date.now(), pageLastUsed: Date.now() };
   }
 
   // 在已有 Context 中新建 Page 并完成 SDK 初始化（Cookie 由 Context 自动继承）
@@ -377,13 +449,23 @@ export default class BrowserService {
   private async getOrCreateSession(options: BrowserRequestOptions): Promise<BrowserSession> {
     const cached = this.sessions.get(options.sessionId);
     if (cached) {
-      // Page 在上次请求结束时已关闭；检查 Context 是否仍存活
       const contextAlive = await cached.context.cookies().then(() => true).catch(() => false);
       if (contextAlive) {
-        // Context 存活（Cookie 完整）：只需重建 Page，无需重建 Context
+        const pageAlive = cached.page !== null && !cached.page.isClosed();
+        if (pageAlive) {
+          // Page 仍存活：直接复用，无需重新导航和初始化 SDK
+          logger.info(`BrowserService 复用已存在 Page（无需重建）: ${options.sessionId}`);
+          cached.lastUsed = Date.now();
+          cached.pageLastUsed = Date.now();
+          return cached;
+        }
+        // Page 空闲超时或意外关闭，重建 Page；设备已注册，10s 等待足够通过 shark
         logger.info(`BrowserService 重建 Page（复用 Context）: ${options.sessionId}`);
         cached.page = await this.createPageInContext(cached.context, options);
+        logger.info("BrowserService 页面重建后等待 10s 让 shark 处理新 msToken...");
+        await cached.page.waitForTimeout(10000);
         cached.lastUsed = Date.now();
+        cached.pageLastUsed = Date.now();
         return cached;
       }
       // Context 已失效，完整重建
@@ -406,9 +488,15 @@ export default class BrowserService {
     const now = Date.now();
     for (const [id, session] of this.sessions) {
       if (now - session.lastUsed > SESSION_TTL_MS) {
+        // Context 超时：整体销毁（含 Page）
         logger.info(`BrowserService 清理过期会话: ${id}`);
         this.sessions.delete(id);
         await this.closeContext(session.context);
+      } else if (session.page && !session.page.isClosed() && now - session.pageLastUsed > PAGE_IDLE_TTL_MS) {
+        // Page 空闲超时：只关 Page 释放内存，Context（设备 Cookie）继续保留
+        logger.info(`BrowserService 关闭空闲 Page（节省内存）: ${id}`);
+        session.page.close().catch(() => undefined);
+        session.page = null;
       }
     }
     if (this.sessions.size === 0 && this.cleanupTimer) {
@@ -437,8 +525,9 @@ export default class BrowserService {
   }
 
   private async launchBrowser(): Promise<Browser> {
+    const headless = process.env.BROWSER_HEADLESS === "true";
     return launch({
-      headless: false,
+      headless,
       launchOptions:{
         executablePath: "C:\\Users\\Administrator\\.cloakbrowser\\chromium-146.0.7680.177.4\\chrome.exe",
       },
@@ -465,6 +554,7 @@ export default class BrowserService {
       // 等待 acrawler SDK 加载并初始化签名函数
       const sdkReady = await page.waitForFunction(
         () => !!(window as any).byted_acrawler?.frontierSign,
+        undefined,
         { timeout: 20000 }
       ).then(() => true).catch(() => false);
       logger.info(`BrowserService acrawler SDK ${sdkReady ? "已就绪" : "未就绪（无签名功能）"}`);
@@ -472,9 +562,18 @@ export default class BrowserService {
       // 等待 SDK 生成 msToken（_tea_web_id 已在 createSession 预注入，无需等待）
       const riskCookiesReady = await page.waitForFunction(
         () => document.cookie.includes("msToken="),
+        undefined,
         { timeout: 15000 }
       ).then(() => true).catch(() => false);
       logger.info(`BrowserService 风控 Cookie ${riskCookiesReady ? "已就绪" : "未完全就绪，继续尝试"}`);
+
+      // 等待 odin_tt（国内站设备级认证 Cookie），国际站不会生成，超时后继续
+      const odinttReady = await page.waitForFunction(
+        () => document.cookie.includes("odin_tt="),
+        undefined,
+        { timeout: 10000 }
+      ).then(() => true).catch(() => false);
+      logger.info(`BrowserService odin_tt ${odinttReady ? "已就绪" : "未就绪（国际站无此 Cookie）"}`);
 
       // 读取 SDK 生成的 _tea_web_id 并反馈给 acrawler，确保签名使用正确的 WebID
       await page.evaluate(() => {

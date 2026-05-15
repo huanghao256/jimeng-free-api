@@ -15,6 +15,7 @@
   "scripts": {
     "dev": "tsup src/index.ts --format cjs,esm --sourcemap --dts --watch --onSuccess \"node --enable-source-maps --no-node-snapshot dist/index.js\"",
     "start": "node --enable-source-maps --no-node-snapshot dist/index.js",
+    "start:prod": "node --enable-source-maps --no-node-snapshot dist/index.js --env prod",
     "build": "tsup src/index.ts --format cjs,esm --sourcemap --dts --clean",
     "test": "echo \"Error: no test specified\" && exit 1",
     "format": "prettier --write \"src/**/*.{ts,js,json}\"",
@@ -40,6 +41,7 @@
   "homepage": "https://github.com/your-repo/jimeng-api#readme",
   "dependencies": {
     "axios": "^1.6.7",
+    "better-sqlite3": "^11.10.0",
     "cloakbrowser": "^0.3.28",
     "colors": "^1.4.0",
     "crc-32": "^1.2.2",
